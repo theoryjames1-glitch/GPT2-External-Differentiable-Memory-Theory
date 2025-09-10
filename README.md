@@ -502,3 +502,196 @@ Together, this hybrid setup allows GPT-2 to:
 * Adapt cheaply with LoRA.
 
 
+### PSEUDOCODE
+
+Perfect 🚀 — let’s sketch the **Hybrid GPT-2 with Three-Tier Memory**:
+
+* **Tier 1: Early Recurrent Memory** (before GPT-2)
+
+  * Compress embeddings into a rolling summary.
+  * Helps continuity before GPT-2 even sees the input.
+
+* **Tier 2: External Differentiable Memory (EDM)** (after GPT-2)
+
+  * Stores hidden states in key–value slots.
+  * Enables explicit retrieval of older information, even across prompts.
+
+* **Tier 3: Late Recurrent Memory** (after EDM)
+
+  * Smooths final hidden states before LM head.
+  * Maintains stylistic and temporal consistency.
+
+---
+
+# 📜 Hybrid GPT-2 Memory Architecture
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import GPT2LMHeadModel, AutoTokenizer
+from peft import LoraConfig, get_peft_model
+
+
+# -------------------
+# Recurrent Memory Layer (GRU/LSTM)
+# -------------------
+class RecurrentMemoryLayer(nn.Module):
+    def __init__(self, hidden_size, memory_type="gru"):
+        super().__init__()
+        if memory_type == "gru":
+            self.rnn = nn.GRU(hidden_size, hidden_size, batch_first=True)
+        elif memory_type == "lstm":
+            self.rnn = nn.LSTM(hidden_size, hidden_size, batch_first=True)
+        else:
+            raise ValueError("memory_type must be 'gru' or 'lstm'")
+        self.hidden = None
+
+    def reset(self):
+        self.hidden = None
+
+    def forward(self, seq):
+        out, self.hidden = self.rnn(seq, self.hidden)
+        return out
+
+
+# -------------------
+# External Differentiable Memory
+# -------------------
+class ExternalDifferentiableMemory(nn.Module):
+    def __init__(self, hidden_size, memory_slots=128):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.memory_slots = memory_slots
+
+        self.key_proj = nn.Linear(hidden_size, hidden_size)
+        self.val_proj = nn.Linear(hidden_size, hidden_size)
+        self.query_proj = nn.Linear(hidden_size, hidden_size)
+
+        self.register_buffer("keys", torch.zeros(memory_slots, hidden_size))
+        self.register_buffer("values", torch.zeros(memory_slots, hidden_size))
+        self.ptr = 0
+
+    def reset(self):
+        self.keys.zero_()
+        self.values.zero_()
+        self.ptr = 0
+
+    def write(self, hidden):
+        k = self.key_proj(hidden).mean(dim=0)
+        v = self.val_proj(hidden).mean(dim=0)
+        self.keys[self.ptr % self.memory_slots] = k.detach()
+        self.values[self.ptr % self.memory_slots] = v.detach()
+        self.ptr += 1
+
+    def read(self, hidden):
+        if self.ptr == 0:
+            return torch.zeros_like(hidden)
+        q = self.query_proj(hidden)
+        attn = torch.matmul(q, self.keys.T)
+        attn = F.softmax(attn, dim=-1)
+        return torch.matmul(attn, self.values)
+
+    def forward(self, hidden_states):
+        outputs = []
+        for t in range(hidden_states.size(1)):
+            h_t = hidden_states[:, t, :]
+            r_t = self.read(h_t)
+            h_comb = h_t + r_t
+            self.write(h_t)
+            outputs.append(h_comb.unsqueeze(1))
+        return torch.cat(outputs, dim=1)
+
+
+# -------------------
+# Hybrid GPT-2 Model
+# -------------------
+class GPT2HybridMemory(nn.Module):
+    def __init__(self, model_name="gpt2", memory_type="gru",
+                 memory_slots=128, use_lora=False, persistent=False):
+        super().__init__()
+        self.gpt2 = GPT2LMHeadModel.from_pretrained(model_name)
+
+        if use_lora:
+            lora_config = LoraConfig(
+                r=8,
+                lora_alpha=16,
+                target_modules=["c_attn", "c_proj"],
+                lora_dropout=0.05,
+                task_type="CAUSAL_LM",
+            )
+            self.gpt2 = get_peft_model(self.gpt2, lora_config)
+
+        hidden_size = self.gpt2.config.hidden_size
+        self.early_memory = RecurrentMemoryLayer(hidden_size, memory_type)
+        self.edm = ExternalDifferentiableMemory(hidden_size, memory_slots)
+        self.late_memory = RecurrentMemoryLayer(hidden_size, memory_type)
+        self.persistent = persistent
+
+    def reset_memory(self):
+        self.early_memory.reset()
+        self.late_memory.reset()
+        self.edm.reset()
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None):
+        # ---- Embeddings ----
+        inputs_embeds = self.gpt2.transformer.wte(input_ids)
+        pos_ids = torch.arange(0, input_ids.size(1), device=input_ids.device).unsqueeze(0)
+        pos_embeds = self.gpt2.transformer.wpe(pos_ids)
+        hidden = inputs_embeds + pos_embeds
+
+        # ---- Early recurrent memory ----
+        hidden = self.early_memory(hidden)
+
+        # ---- GPT-2 transformer ----
+        transformer_outputs = self.gpt2.transformer(
+            inputs_embeds=hidden,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden = transformer_outputs.last_hidden_state
+
+        # ---- External differentiable memory ----
+        hidden = self.edm(hidden)
+
+        # ---- Late recurrent memory ----
+        hidden = self.late_memory(hidden)
+
+        # ---- LM head ----
+        logits = self.gpt2.lm_head(hidden)
+
+        # ---- Loss ----
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
+
+        return {"logits": logits, "loss": loss}
+
+    def generate(self, *args, **kwargs):
+        if not self.persistent:
+            self.reset_memory()
+        return self.gpt2.generate(*args, **kwargs)
+```
+
+---
+
+# ✅ Why This Hybrid is Interesting
+
+* **Early RNN** = keeps local continuity in embeddings.
+* **GPT-2** = processes context with self-attention (1024 tokens).
+* **EDM** = long-term explicit recall, can persist across prompts.
+* **Late RNN** = smooths final states, enforces temporal consistency.
+
+It creates a **multi-tier memory system**:
+
+1. **Short-term rolling summary** (RNNs).
+2. **Medium-term windowed context** (attention).
+3. **Long-term episodic recall** (EDM).
+
